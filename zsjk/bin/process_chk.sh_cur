@@ -1,0 +1,200 @@
+#!/bin/bash 
+#Whritted: dufs
+#E-mail:   fengshan.du@zznode.com
+#Date:     2016-09-19 13:00
+
+#disk check
+
+SH_NAME=`basename $0`
+SH_HOME=$HOME/zsjk
+SH_Log=$SH_HOME/log/${0%\.sh*}.log
+
+function outlog {
+                    echo "`date '+%Y-%m-%d %T'` : " "$*" >>  $SH_Log
+                    logSize=`ls -lrt $SH_Log|awk '{print $5}'`
+                    if [ $logSize -gt 10240000 ]
+                    then
+                         cp -rp $SH_Log $SH_Log.`date '+%Y-%m-%d'`
+                         gzip $SH_Log.`date '+%Y-%m-%d'`
+                         cat /dev/null>$SH_Log
+                    fi
+                }
+
+
+
+     
+
+outlog  =============================================================
+outlog  start check
+
+sysapp="【集中故障】"
+msgTemp1=$SH_HOME/conf/sendmsg_temp_begin.sql
+msgTemp2=$SH_HOME/conf/sendmsg_temp_end.sql
+
+if [ ! -f $msgTemp1 -o ! -f $msgTemp2 ]
+then
+     outlog can not find $msgTemp1 or $$msgTemp2, please check !!!
+     exit 0
+fi
+
+ip_list=$SH_HOME/conf/appchk.conf
+
+if [ ! -f $ip_list ]
+then
+     outlog can not find $ip_list, please check !!!
+     exit 0
+fi
+
+psInfo=""
+cat /dev/null > $SH_HOME/data/ps_info_cur.txt
+sess=`date +'%y%m%d%h%M'`
+
+cd $SH_HOME/bin
+
+for  line in `cat $ip_list`
+do
+        sharppos=$(echo $line|awk '{print index($1,"#")}')
+
+        if [ $sharppos = 1 ]
+        then
+            #echo remarked line,ignore
+            continue
+        fi
+
+        outlog -------------------------------------------------------------   
+        Local_IP=`echo $line | awk -F"," '{print $1}'`
+        chk_user=`echo $line | awk -F"," '{print $2}'`
+        ssh_port=`echo $line | awk -F"," '{print $3}'`
+
+        outlog read config: Local_IP $Local_IP
+        outlog read config: chk_user $chk_user
+        outlog read config: ssh_port $ssh_port
+
+        ssh -t -p $ssh_port $chk_user@$Local_IP "ps -fu $chk_user" >$SH_HOME/data/ps.$Local_IP.$ssh_port
+        rowNum=`cat $SH_HOME/data/ps.$Local_IP.$ssh_port|wc -l`
+        
+        if [ $rowNum -eq 0 ]
+        then
+             outlog can not get 'ps -fu $chk_user' from $Local_IP, please check !!!
+             
+             curT=`date '+%Y-%m-%d %T'`
+             msg="$sysapp$curT获取$Local_IP的ps -fu $chk_user信息失败，请检查。"
+             sed -e "s/__MSG__/$msg/g" \
+                 -e "s/__SHELL__/$SH_NAME/g"    $msgTemp > $SH_HOME/bin/process_chk_$Local_IP.$ssh_port.sql
+             outlog `./sendMsg.sh process_chk_$Local_IP.$ssh_port.sql`
+
+             rm $SH_HOME/bin/process_chk_$Local_IP.$ssh_port.sql
+             
+             ./zsjkAlarmIsert.sh "进程监控,1,$msg,10.102.52.9,zsjk/bin/process_chk.sh_cur"
+
+             continue
+        else
+             psCur=`cat $SH_HOME/data/ps.$Local_IP.$ssh_port|grep "java -D"|awk -F"java " '{print $2}'|awk '{print $1}'|sed 's/\-D/D/g'`
+             psInfo=$psCur" "$psInfo
+             outlog running process : $psCur
+             echo $Local_IP"_"$ssh_port,$psCur >> $SH_HOME/data/ps_info_cur.txt
+        fi
+						
+        outlog -------------------------------------------------------------
+done    
+
+#outlog all running process :  $psInfo
+cat /dev/null >$SH_HOME/data/allps_cur.list
+for i in `echo $psInfo`
+do
+    echo $i >>$SH_HOME/data/allps_cur.list
+done
+
+ps_conf=$SH_HOME/conf/process_cur.conf
+
+# check 1 : 进程重复
+cat $SH_HOME/data/allps_cur.list|sort |uniq -c|awk '{if($1>1) print$2","$1}' >$SH_HOME/data/psRept_cur.list
+if [ `cat $SH_HOME/data/psRept_cur.list|wc -l` -gt 0 ]
+then
+     for j in `cat $SH_HOME/data/psRept_cur.list`
+     do  
+         psName=`echo $j|awk -F"," '{print $1}'`
+         psNum=`echo $j|awk -F"," '{print $2}'`
+         isChk=`cat $ps_conf|egrep -v "^#"|grep -wc "$psName"`
+         if [ $isChk -eq 0 ]
+         then
+              continue
+         fi
+         psPos=`cat $SH_HOME/data/ps_info_cur.txt |grep -w "$psName"|awk -F"," '{print $1}'`
+         outlog repeat process : $psName , repeat times : $psNum , running on $psPos
+         curT=`date '+%Y-%m-%d %T'`
+         msg="$sysapp$curT监测到$psName进程运行重复$psNum次，该进程同时运行在"`echo $psPos`"，请检查。"
+         outlog send mesge : $msg
+         
+         cat $msgTemp1 >$SH_HOME/bin/process_chk_rep_cur.sql
+         echo "'"$msg"'" >>$SH_HOME/bin/process_chk_rep_cur.sql
+         cat $msgTemp2 >>$SH_HOME/bin/process_chk_rep_cur.sql
+
+         outlog `./sendMsg.sh process_chk_rep_cur.sql`
+
+         rm $SH_HOME/bin/process_chk_rep_cur.sql
+         
+         ./zsjkAlarmIsert.sh "进程监控,1,$msg,10.102.52.9,zsjk/bin/process_chk.sh_cur"
+
+     done
+fi
+
+
+# check 2 : 进程缺少
+
+
+if [ ! -f $ps_conf ]
+then
+     outlog can not find $ps_conf , please check !!!
+     exit 0
+fi
+
+psNoR=""
+while read line
+do
+     sharppos=$(echo $line|awk '{print index($1,"#")}')
+        
+     if [ $sharppos = 1 ]
+     then
+          #echo remarked line,ignore
+          continue
+     fi
+   
+     proKey=`echo $line | awk -F":" '{print $2}'`
+     proNum=`cat $SH_HOME/data/ps_info_cur.txt| grep -wc "$proKey"` 
+     if [ $proNum -eq 0 ]
+     then 
+          psNoR=$proKey" "$psNoR
+     else
+          continue
+     fi
+done < $ps_conf
+
+if [ "$psNoR" = "" ]
+then
+     outlog all process is running . it is OK. 
+else
+     outlog find not running process : $psNoR please check !!
+     curT=`date '+%Y-%m-%d %T'`
+     msg="$sysapp$curT监测到以下进程未运行：$psNoR请检查。"
+     outlog send mesge : $msg
+
+     cat $msgTemp1 >$SH_HOME/bin/process_chk_notrun_cur.sql
+     echo "'"$msg"'" >>$SH_HOME/bin/process_chk_notrun_cur.sql
+     cat $msgTemp2 >>$SH_HOME/bin/process_chk_notrun_cur.sql
+     outlog `./sendMsg.sh process_chk_notrun_cur.sql`
+
+     cd $SH_HOME/pyChk/
+     python Demo_sms.pyo 13730885681 "$msg"
+      
+     rm $SH_HOME/bin/process_chk_notrun_cur.sql
+     
+     $SH_HOME/bin/zsjkAlarmIsert.sh "进程监控,1,$msg,10.102.52.9,zsjk/bin/process_chk.sh_cur"
+
+fi
+
+cp $SH_HOME/data/ps_info_cur.txt $SH_HOME/conf/ps_info_cur.txt
+#rm $SH_HOME/data/ps.*
+
+outlog  =============================================================
+exit 0
